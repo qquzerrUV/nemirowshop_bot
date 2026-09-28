@@ -9,7 +9,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
-    ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+    ReplyKeyboardMarkup, KeyboardButton, FSInputFile
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 from dotenv import load_dotenv
@@ -43,42 +43,42 @@ async def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
                 username TEXT,
-                full_name TEXT,
                 country TEXT,
                 price INTEGER,
-                city TEXT,
-                delivery TEXT,
-                comment TEXT,
                 status TEXT DEFAULT 'new',
-                created_at TEXT,
-                admin_note TEXT
+                created_at TEXT
             )
         """)
         await db.execute("""
-            CREATE TABLE IF NOT EXISTS messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                from_admin INTEGER,
-                text TEXT,
-                created_at TEXT
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
             )
         """)
         await db.commit()
 
-# ====================== СОСТОЯНИЯ FSM ======================
+async def get_banner():
+    async with aiosqlite.connect("database.db") as db:
+        cursor = await db.execute("SELECT value FROM settings WHERE key = 'banner'")
+        row = await cursor.fetchone()
+        return row[0] if row else None
 
-class OrderStates(StatesGroup):
-    waiting_full_name = State()
-    waiting_city = State()
-    waiting_delivery = State()
-    waiting_comment = State()
+async def set_banner(file_id: str):
+    async with aiosqlite.connect("database.db") as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('banner', ?)",
+            (file_id,)
+        )
+        await db.commit()
+
+# ====================== СОСТОЯНИЯ ======================
 
 class AdminStates(StatesGroup):
     add_country_name = State()
     add_country_price = State()
     add_country_desc = State()
     reply_to_user = State()
-    change_status = State()
+    waiting_banner = State()
 
 # ====================== КЛАВИАТУРЫ ======================
 
@@ -87,6 +87,7 @@ def main_kb(is_admin: bool = False):
     builder.button(text="📱 Купить номер")
     builder.button(text="📦 Мои заказы")
     builder.button(text="💬 Написать продавцу")
+    builder.button(text="ℹ️ Информация")
     if is_admin:
         builder.button(text="⚙️ Админ-панель")
     builder.adjust(2)
@@ -97,6 +98,7 @@ def admin_kb():
     builder.button(text="➕ Добавить страну")
     builder.button(text="📋 Список стран")
     builder.button(text="📦 Все заказы")
+    builder.button(text="🖼️ Загрузить баннер")
     builder.button(text="📊 Статистика")
     builder.button(text="◀️ В меню")
     builder.adjust(2)
@@ -108,17 +110,28 @@ def cancel_kb():
         resize_keyboard=True
     )
 
-# ====================== КОМАНДЫ ======================
+# ====================== СТАРТ ======================
 
 @router.message(CommandStart())
 async def cmd_start(message: Message):
     is_admin = message.from_user.id == ADMIN_ID
-    await message.answer(
-        f"Привет, {message.from_user.first_name}!\n\n"
+    banner = await get_banner()
+
+    text = (
+        f"Привет, <b>{message.from_user.first_name}</b>!\n\n"
         "Я бот по продаже физических SIM-карт и номеров.\n"
-        "Выбирай страну → оформляй заказ → получай номер.",
-        reply_markup=main_kb(is_admin)
+        "Выбирай страну → оформляй заказ → получай номер."
     )
+
+    if banner:
+        await message.answer_photo(
+            photo=banner,
+            caption=text,
+            parse_mode="HTML",
+            reply_markup=main_kb(is_admin)
+        )
+    else:
+        await message.answer(text, parse_mode="HTML", reply_markup=main_kb(is_admin))
 
 @router.message(F.text == "◀️ В меню")
 async def back_to_menu(message: Message, state: FSMContext):
@@ -126,13 +139,24 @@ async def back_to_menu(message: Message, state: FSMContext):
     is_admin = message.from_user.id == ADMIN_ID
     await message.answer("Главное меню", reply_markup=main_kb(is_admin))
 
+@router.message(F.text == "ℹ️ Информация")
+async def info(message: Message):
+    await message.answer(
+        "<b>Информация о магазине</b>\n\n"
+        "• Продаём физические SIM-карты\n"
+        "• Работаем по предоплате\n"
+        "• Доставка / встреча — по договорённости\n\n"
+        "По всем вопросам пишите через кнопку «Написать продавцу»",
+        parse_mode="HTML"
+    )
+
 # ====================== КАТАЛОГ ======================
 
 @router.message(F.text == "📱 Купить номер")
 async def show_catalog(message: Message):
     async with aiosqlite.connect("database.db") as db:
         cursor = await db.execute(
-            "SELECT id, name, price, description FROM countries WHERE is_active = 1 ORDER BY name"
+            "SELECT id, name, price FROM countries WHERE is_active = 1 ORDER BY name"
         )
         countries = await cursor.fetchall()
 
@@ -141,17 +165,14 @@ async def show_catalog(message: Message):
         return
 
     builder = InlineKeyboardBuilder()
-    for c_id, name, price, desc in countries:
-        builder.button(
-            text=f"{name} — {price} ₽",
-            callback_data=f"country_{c_id}"
-        )
+    for c_id, name, price in countries:
+        builder.button(text=f"{name} — {price} ₽", callback_data=f"country_{c_id}")
     builder.adjust(1)
 
     await message.answer("Выбери страну / оператора:", reply_markup=builder.as_markup())
 
 @router.callback_query(F.data.startswith("country_"))
-async def select_country(callback: CallbackQuery, state: FSMContext):
+async def select_country(callback: CallbackQuery):
     country_id = int(callback.data.split("_")[1])
 
     async with aiosqlite.connect("database.db") as db:
@@ -179,10 +200,10 @@ async def back_catalog(callback: CallbackQuery):
     await show_catalog(callback.message)
     await callback.answer()
 
-# ====================== ОФОРМЛЕНИЕ ЗАКАЗА ======================
+# ====================== ОФОРМЛЕНИЕ ЗАКАЗА (упрощённое) ======================
 
 @router.callback_query(F.data.startswith("order_"))
-async def start_order(callback: CallbackQuery, state: FSMContext):
+async def make_order(callback: CallbackQuery):
     country_id = int(callback.data.split("_")[1])
 
     async with aiosqlite.connect("database.db") as db:
@@ -196,114 +217,43 @@ async def start_order(callback: CallbackQuery, state: FSMContext):
         return
 
     name, price = row
-    await state.update_data(country=name, price=price, country_id=country_id)
 
-    await callback.message.answer(
-        f"Оформляем заказ на: <b>{name}</b> ({price} ₽)\n\n"
-        "Напиши своё <b>ФИО</b> (как в паспорте):",
-        parse_mode="HTML",
-        reply_markup=cancel_kb()
-    )
-    await state.set_state(OrderStates.waiting_full_name)
-    await callback.answer()
-
-@router.message(OrderStates.waiting_full_name)
-async def process_full_name(message: Message, state: FSMContext):
-    if message.text == "❌ Отмена":
-        await state.clear()
-        await message.answer("Отменено", reply_markup=main_kb(message.from_user.id == ADMIN_ID))
-        return
-
-    await state.update_data(full_name=message.text)
-    await message.answer("В каком городе ты находишься?")
-    await state.set_state(OrderStates.waiting_city)
-
-@router.message(OrderStates.waiting_city)
-async def process_city(message: Message, state: FSMContext):
-    if message.text == "❌ Отмена":
-        await state.clear()
-        await message.answer("Отменено", reply_markup=main_kb(message.from_user.id == ADMIN_ID))
-        return
-
-    await state.update_data(city=message.text)
-    await message.answer(
-        "Как удобнее получить номер?\n"
-        "(самовывоз / доставка СДЭК / почта / встреча и т.д.)"
-    )
-    await state.set_state(OrderStates.waiting_delivery)
-
-@router.message(OrderStates.waiting_delivery)
-async def process_delivery(message: Message, state: FSMContext):
-    if message.text == "❌ Отмена":
-        await state.clear()
-        await message.answer("Отменено", reply_markup=main_kb(message.from_user.id == ADMIN_ID))
-        return
-
-    await state.update_data(delivery=message.text)
-    await message.answer("Комментарий к заказу (можно пропустить, написав «-»):")
-    await state.set_state(OrderStates.waiting_comment)
-
-@router.message(OrderStates.waiting_comment)
-async def process_comment(message: Message, state: FSMContext):
-    if message.text == "❌ Отмена":
-        await state.clear()
-        await message.answer("Отменено", reply_markup=main_kb(message.from_user.id == ADMIN_ID))
-        return
-
-    data = await state.get_data()
-    comment = message.text if message.text != "-" else ""
-
-    # Сохраняем заказ
     async with aiosqlite.connect("database.db") as db:
         cursor = await db.execute(
-            """INSERT INTO orders 
-               (user_id, username, full_name, country, price, city, delivery, comment, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            """INSERT INTO orders (user_id, username, country, price, created_at)
+               VALUES (?, ?, ?, ?, ?)""",
             (
-                message.from_user.id,
-                message.from_user.username,
-                data["full_name"],
-                data["country"],
-                data["price"],
-                data["city"],
-                data["delivery"],
-                comment,
+                callback.from_user.id,
+                callback.from_user.username,
+                name,
+                price,
                 datetime.now().strftime("%Y-%m-%d %H:%M")
             )
         )
         order_id = cursor.lastrowid
         await db.commit()
 
-    # Уведомляем клиента
-    await message.answer(
+    await callback.message.answer(
         f"✅ Заказ <b>#{order_id}</b> принят!\n\n"
-        f"Страна: {data['country']}\n"
-        f"Цена: {data['price']} ₽\n"
-        f"ФИО: {data['full_name']}\n"
-        f"Город: {data['city']}\n"
-        f"Получение: {data['delivery']}\n\n"
+        f"Страна: {name}\n"
+        f"Цена: {price} ₽\n\n"
         "Скоро с тобой свяжется администратор.",
-        parse_mode="HTML",
-        reply_markup=main_kb(message.from_user.id == ADMIN_ID)
+        parse_mode="HTML"
     )
 
-    # Уведомляем админа
+    # Уведомление админу
     text_admin = (
         f"🆕 <b>Новый заказ #{order_id}</b>\n\n"
-        f"От: @{message.from_user.username or 'нет'} (ID: {message.from_user.id})\n"
-        f"Страна: {data['country']}\n"
-        f"Цена: {data['price']} ₽\n"
-        f"ФИО: {data['full_name']}\n"
-        f"Город: {data['city']}\n"
-        f"Получение: {data['delivery']}\n"
-        f"Комментарий: {comment or '—'}"
+        f"От: @{callback.from_user.username or 'нет'} (ID: {callback.from_user.id})\n"
+        f"Страна: {name}\n"
+        f"Цена: {price} ₽"
     )
     builder = InlineKeyboardBuilder()
-    builder.button(text="💬 Ответить", callback_data=f"reply_{message.from_user.id}")
+    builder.button(text="💬 Ответить", callback_data=f"reply_{callback.from_user.id}")
     builder.button(text="📦 Статус", callback_data=f"status_{order_id}")
 
     await bot.send_message(ADMIN_ID, text_admin, parse_mode="HTML", reply_markup=builder.as_markup())
-    await state.clear()
+    await callback.answer()
 
 # ====================== МОИ ЗАКАЗЫ ======================
 
@@ -326,7 +276,7 @@ async def my_orders(message: Message):
 
     await message.answer(text, parse_mode="HTML")
 
-# ====================== ПЕРЕПИСКА С АДМИНОМ ======================
+# ====================== ПЕРЕПИСКА ======================
 
 @router.message(F.text == "💬 Написать продавцу")
 async def start_chat(message: Message, state: FSMContext):
@@ -335,22 +285,23 @@ async def start_chat(message: Message, state: FSMContext):
         reply_markup=cancel_kb()
     )
     await state.set_state(AdminStates.reply_to_user)
-    await state.update_data(target_user=None)  # клиент пишет админу
+    await state.update_data(target_user=None)
 
 @router.message(AdminStates.reply_to_user)
-async def process_message_to_admin(message: Message, state: FSMContext):
+async def process_message(message: Message, state: FSMContext):
     if message.text == "❌ Отмена":
         await state.clear()
-        await message.answer("Отменено", reply_markup=main_kb(message.from_user.id == ADMIN_ID))
+        is_admin = message.from_user.id == ADMIN_ID
+        await message.answer("Отменено", reply_markup=main_kb(is_admin) if not is_admin else admin_kb())
         return
 
     data = await state.get_data()
     target = data.get("target_user")
 
-    if target:  # админ отвечает клиенту
+    if target:  # админ → клиент
         await bot.send_message(target, f"💬 <b>Ответ продавца:</b>\n\n{message.text}", parse_mode="HTML")
         await message.answer("Сообщение отправлено клиенту.", reply_markup=admin_kb())
-    else:  # клиент пишет админу
+    else:  # клиент → админ
         await bot.send_message(
             ADMIN_ID,
             f"💬 Сообщение от @{message.from_user.username or 'нет'} (ID: {message.from_user.id}):\n\n{message.text}",
@@ -377,6 +328,32 @@ async def admin_panel(message: Message):
     if message.from_user.id != ADMIN_ID:
         return
     await message.answer("Админ-панель", reply_markup=admin_kb())
+
+@router.message(F.text == "🖼️ Загрузить баннер")
+async def upload_banner_start(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await message.answer(
+        "Отправь фото, которое будет показываться при /start\n"
+        "(просто пришли картинку)",
+        reply_markup=cancel_kb()
+    )
+    await state.set_state(AdminStates.waiting_banner)
+
+@router.message(AdminStates.waiting_banner, F.photo)
+async def save_banner(message: Message, state: FSMContext):
+    file_id = message.photo[-1].file_id
+    await set_banner(file_id)
+    await message.answer("✅ Баннер успешно установлен!", reply_markup=admin_kb())
+    await state.clear()
+
+@router.message(AdminStates.waiting_banner)
+async def banner_wrong(message: Message):
+    if message.text == "❌ Отмена":
+        await message.answer("Отменено", reply_markup=admin_kb())
+        await message.answer.fsm_context.clear() if hasattr(message, 'answer') else None
+        return
+    await message.answer("Пришли именно фото.")
 
 @router.message(F.text == "➕ Добавить страну")
 async def add_country_start(message: Message, state: FSMContext):
@@ -494,7 +471,7 @@ async def stats(message: Message):
         parse_mode="HTML"
     )
 
-# Изменение статуса заказа
+# Статусы заказа
 @router.callback_query(F.data.startswith("status_"))
 async def change_status_start(callback: CallbackQuery, state: FSMContext):
     order_id = int(callback.data.split("_")[1])
