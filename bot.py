@@ -82,9 +82,6 @@ async def set_setting(key: str, value: str):
         await db.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
         await db.commit()
 
-async def is_maintenance():
-    return await get_setting("maintenance", "0") == "1"
-
 async def is_test_user(user_id: int):
     async with aiosqlite.connect("database.db") as db:
         cur = await db.execute("SELECT 1 FROM test_users WHERE user_id = ?", (user_id,))
@@ -93,7 +90,6 @@ async def is_test_user(user_id: int):
 # ====================== Безопасное редактирование ======================
 
 async def safe_edit(callback: CallbackQuery, text: str, reply_markup=None, parse_mode="HTML"):
-    """Безопасно редактирует сообщение (работает и с фото, и с текстом)"""
     try:
         await callback.message.edit_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
     except Exception:
@@ -120,16 +116,6 @@ async def create_invoice(amount: int, description: str, order_id: int):
             data = await resp.json()
             return data.get("result") if data.get("ok") else None
 
-async def check_invoice(invoice_id: str):
-    url = f"https://pay.crypt.bot/api/getInvoices?invoice_ids={invoice_id}"
-    headers = {"Crypto-Pay-API-Token": CRYPTO_BOT_TOKEN}
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers=headers) as resp:
-            data = await resp.json()
-            if data.get("ok") and data["result"]["items"]:
-                return data["result"]["items"][0]
-            return None
-
 # ====================== FSM ======================
 
 class Form(StatesGroup):
@@ -138,7 +124,6 @@ class Form(StatesGroup):
     add_country_desc = State()
     add_numbers = State()
     reply_user = State()
-    waiting_banner = State()
     add_test_user = State()
 
 # ====================== КЛАВИАТУРЫ ======================
@@ -155,15 +140,19 @@ def main_kb(is_admin=False):
 
 def admin_kb():
     b = InlineKeyboardBuilder()
+    b.row(InlineKeyboardButton(text="📦  Номера и страны", callback_data="numbers_menu"))
+    b.row(InlineKeyboardButton(text="📋  Заказы", callback_data="all_orders"))
+    b.row(InlineKeyboardButton(text="🧪  Тестовый режим", callback_data="test_mode"))
+    b.row(InlineKeyboardButton(text="📊  Статистика", callback_data="stats"))
+    b.row(InlineKeyboardButton(text="◀️  Главное меню", callback_data="main_menu"))
+    return b.as_markup()
+
+def numbers_kb():
+    b = InlineKeyboardBuilder()
     b.row(InlineKeyboardButton(text="➕  Добавить страну", callback_data="add_country"))
     b.row(InlineKeyboardButton(text="📋  Управление странами", callback_data="manage_countries"))
     b.row(InlineKeyboardButton(text="🔢  Добавить номера", callback_data="add_numbers"))
-    b.row(InlineKeyboardButton(text="📦  Заказы", callback_data="all_orders"))
-    b.row(InlineKeyboardButton(text="🧪  Тестовый режим", callback_data="test_mode"))
-    b.row(InlineKeyboardButton(text="🛠  Режим тех. работ", callback_data="maintenance"))
-    b.row(InlineKeyboardButton(text="🖼️  Баннер", callback_data="banner"))
-    b.row(InlineKeyboardButton(text="📊  Статистика", callback_data="stats"))
-    b.row(InlineKeyboardButton(text="◀️  Главное меню", callback_data="main_menu"))
+    b.row(InlineKeyboardButton(text="◀️  Назад", callback_data="admin"))
     return b.as_markup()
 
 def back_kb(callback="main_menu"):
@@ -177,29 +166,24 @@ async def show_main_menu(target, user_id: int):
     is_admin = user_id == ADMIN_ID
     banner = await get_setting("banner")
 
-    if await is_maintenance() and not is_admin:
-        text = "🛠 <b>Технические работы</b>\n\nБот временно недоступен. Попробуйте позже."
-        kb = None
-    else:
-        text = (
-            f"<b>Добро пожаловать!</b>\n\n"
-            f"Привет, <b>{target.from_user.first_name}</b> 👋\n\n"
-            f"Выбери нужный раздел:"
-        )
-        kb = main_kb(is_admin)
+    text = (
+        f"Привет, <b>{target.from_user.first_name}</b> 👋\n\n"
+        f"Nemirow Shop — магазин физических номеров\n\n"
+        f"Выбери нужный раздел:"
+    )
+    kb = main_kb(is_admin)
 
     if isinstance(target, Message):
-        if banner and not (await is_maintenance() and not is_admin):
+        if banner:
             await target.answer_photo(banner, caption=text, parse_mode="HTML", reply_markup=kb)
         else:
             await target.answer(text, parse_mode="HTML", reply_markup=kb)
     else:
-        # callback
         try:
             await target.message.delete()
         except Exception:
             pass
-        if banner and not (await is_maintenance() and not is_admin):
+        if banner:
             await target.message.answer_photo(banner, caption=text, parse_mode="HTML", reply_markup=kb)
         else:
             await target.message.answer(text, parse_mode="HTML", reply_markup=kb)
@@ -266,10 +250,6 @@ async def cb_reply(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "buy")
 async def cb_buy(callback: CallbackQuery):
-    if await is_maintenance() and callback.from_user.id != ADMIN_ID:
-        await callback.answer("Технические работы", show_alert=True)
-        return
-
     async with aiosqlite.connect("database.db") as db:
         cur = await db.execute("""
             SELECT c.id, c.name, c.price,
@@ -285,7 +265,7 @@ async def cb_buy(callback: CallbackQuery):
 
     b = InlineKeyboardBuilder()
     for cid, name, price, stock in rows:
-        mark = f"· {stock} шт" if stock > 0 else "· нет"
+        mark = f"· {stock} шт" if stock > 0 else "· нет в наличии"
         b.row(InlineKeyboardButton(text=f"{name}  —  {price} ₽  {mark}", callback_data=f"country_{cid}"))
     b.row(InlineKeyboardButton(text="◀️  Назад", callback_data="main_menu"))
 
@@ -316,7 +296,7 @@ async def cb_country(callback: CallbackQuery):
     await safe_edit(callback, text, b.as_markup())
     await callback.answer()
 
-# ====================== ОПЛАТА + ТЕСТОВЫЙ РЕЖИМ ======================
+# ====================== ОПЛАТА ======================
 
 @router.callback_query(F.data.startswith("pay_"))
 async def cb_pay(callback: CallbackQuery):
@@ -336,7 +316,7 @@ async def cb_pay(callback: CallbackQuery):
     name, price = row
     number_id, number = num_row
 
-    # Тестовый режим
+    # Тестовый режим / админ — сразу выдаём
     if await is_test_user(user_id) or user_id == ADMIN_ID:
         async with aiosqlite.connect("database.db") as db:
             await db.execute("UPDATE numbers SET is_sold=1 WHERE id=?", (number_id,))
@@ -350,7 +330,7 @@ async def cb_pay(callback: CallbackQuery):
         await callback.answer()
         return
 
-    # Обычная оплата
+    # Создание заказа + счёта
     async with aiosqlite.connect("database.db") as db:
         cur = await db.execute(
             "INSERT INTO orders (user_id, username, country, price, number, status, created_at) VALUES (?,?,?,?,?,'pending',?)",
@@ -361,7 +341,7 @@ async def cb_pay(callback: CallbackQuery):
 
     invoice = await create_invoice(price, f"{name} | Заказ #{order_id}", order_id)
     if not invoice:
-        await safe_edit(callback, "Ошибка создания счёта.", back_kb())
+        await safe_edit(callback, "Ошибка создания счёта. Попробуйте позже.", back_kb())
         return
 
     async with aiosqlite.connect("database.db") as db:
@@ -370,41 +350,17 @@ async def cb_pay(callback: CallbackQuery):
 
     b = InlineKeyboardBuilder()
     b.row(InlineKeyboardButton(text="💳  Оплатить", url=invoice["pay_url"]))
-    b.row(InlineKeyboardButton(text="🔄  Проверить оплату", callback_data=f"check_{order_id}"))
     b.row(InlineKeyboardButton(text="◀️  В меню", callback_data="main_menu"))
 
-    await safe_edit(callback, f"<b>Заказ #{order_id}</b>\n\n{name}\nСумма: <b>{price} ₽</b>\n\nПосле оплаты нажмите «Проверить оплату»", b.as_markup())
+    await safe_edit(
+        callback,
+        f"<b>Заказ #{order_id}</b>\n\n"
+        f"Страна: {name}\n"
+        f"Сумма: <b>{price} ₽</b>\n\n"
+        f"После оплаты номер будет выдан автоматически.",
+        b.as_markup()
+    )
     await callback.answer()
-
-@router.callback_query(F.data.startswith("check_"))
-async def cb_check(callback: CallbackQuery):
-    order_id = int(callback.data.split("_")[1])
-
-    async with aiosqlite.connect("database.db") as db:
-        cur = await db.execute("SELECT invoice_id, status, number, country FROM orders WHERE id=?", (order_id,))
-        row = await cur.fetchone()
-
-    if not row:
-        await callback.answer("Заказ не найден", show_alert=True)
-        return
-
-    invoice_id, status, number, country = row
-
-    if status == "paid":
-        await safe_edit(callback, f"✅ Уже оплачено\n\nНомер: <code>{number}</code>", back_kb())
-        return
-
-    invoice = await check_invoice(invoice_id)
-    if invoice and invoice["status"] == "paid":
-        async with aiosqlite.connect("database.db") as db:
-            await db.execute("UPDATE orders SET status='paid' WHERE id=?", (order_id,))
-            await db.execute("UPDATE numbers SET is_sold=1 WHERE number=?", (number,))
-            await db.commit()
-
-        await safe_edit(callback, f"✅ <b>Оплата прошла!</b>\n\nСтрана: {country}\nНомер: <code>{number}</code>", back_kb())
-        await bot.send_message(ADMIN_ID, f"✅ Оплачен заказ #{order_id}\n{country} | {number}")
-    else:
-        await callback.answer("Оплата не найдена", show_alert=True)
 
 # ====================== МОИ ЗАКАЗЫ ======================
 
@@ -439,67 +395,13 @@ async def cb_admin(callback: CallbackQuery):
     await safe_edit(callback, "⚙️ <b>Админ-панель</b>", admin_kb())
     await callback.answer()
 
-@router.callback_query(F.data == "maintenance")
-async def cb_maintenance(callback: CallbackQuery):
+# --- Блок "Номера и страны" ---
+@router.callback_query(F.data == "numbers_menu")
+async def cb_numbers_menu(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         return
-    current = await get_setting("maintenance", "0")
-    new = "0" if current == "1" else "1"
-    await set_setting("maintenance", new)
-    status = "ВКЛЮЧЕН" if new == "1" else "ВЫКЛЮЧЕН"
-    await callback.answer(f"Режим тех. работ: {status}", show_alert=True)
-    await cb_admin(callback)
-
-@router.callback_query(F.data == "test_mode")
-async def cb_test_mode(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
-        return
-    b = InlineKeyboardBuilder()
-    b.row(InlineKeyboardButton(text="➕ Добавить пользователя", callback_data="add_test_user"))
-    b.row(InlineKeyboardButton(text="📋 Список тестовых", callback_data="list_test_users"))
-    b.row(InlineKeyboardButton(text="◀️ Назад", callback_data="admin"))
-    await safe_edit(callback, "🧪 <b>Тестовый режим</b>\n\nПользователи из списка получают номера без оплаты.", b.as_markup())
+    await safe_edit(callback, "📦 <b>Номера и страны</b>", numbers_kb())
     await callback.answer()
-
-@router.callback_query(F.data == "add_test_user")
-async def cb_add_test_user(callback: CallbackQuery, state: FSMContext):
-    await safe_edit(callback, "Отправьте Telegram ID пользователя:")
-    await state.set_state(Form.add_test_user)
-    await callback.answer()
-
-@router.message(Form.add_test_user)
-async def process_add_test(message: Message, state: FSMContext):
-    try:
-        uid = int(message.text.strip())
-    except:
-        await message.answer("Нужен числовой ID")
-        return
-    async with aiosqlite.connect("database.db") as db:
-        await db.execute("INSERT OR IGNORE INTO test_users (user_id) VALUES (?)", (uid,))
-        await db.commit()
-    await message.answer(f"✅ Пользователь {uid} добавлен в тестовый режим")
-    await state.clear()
-
-@router.callback_query(F.data == "list_test_users")
-async def cb_list_test(callback: CallbackQuery):
-    async with aiosqlite.connect("database.db") as db:
-        cur = await db.execute("SELECT user_id FROM test_users")
-        rows = await cur.fetchall()
-    text = "<b>Тестовые пользователи:</b>\n\n" + "\n".join(str(r[0]) for r in rows) if rows else "Список пуст"
-    await safe_edit(callback, text, back_kb("test_mode"))
-    await callback.answer()
-
-@router.callback_query(F.data == "banner")
-async def cb_banner(callback: CallbackQuery, state: FSMContext):
-    await safe_edit(callback, "Отправьте фото для баннера:")
-    await state.set_state(Form.waiting_banner)
-    await callback.answer()
-
-@router.message(Form.waiting_banner, F.photo)
-async def save_banner(message: Message, state: FSMContext):
-    await set_setting("banner", message.photo[-1].file_id)
-    await message.answer("✅ Баннер сохранён")
-    await state.clear()
 
 @router.callback_query(F.data == "add_country")
 async def cb_add_country(callback: CallbackQuery, state: FSMContext):
@@ -549,7 +451,7 @@ async def cb_manage(callback: CallbackQuery):
         rows = await cur.fetchall()
 
     if not rows:
-        await safe_edit(callback, "Стран пока нет.", back_kb("admin"))
+        await safe_edit(callback, "Стран пока нет.", back_kb("numbers_menu"))
         await callback.answer()
         return
 
@@ -557,7 +459,7 @@ async def cb_manage(callback: CallbackQuery):
     for cid, name, price, active, stock in rows:
         status = "✅" if active else "❌"
         b.row(InlineKeyboardButton(text=f"{status} {name} · {price}₽ · {stock} шт", callback_data=f"editc_{cid}"))
-    b.row(InlineKeyboardButton(text="◀️ Назад", callback_data="admin"))
+    b.row(InlineKeyboardButton(text="◀️ Назад", callback_data="numbers_menu"))
 
     await safe_edit(callback, "<b>Управление странами</b>\nНажмите на страну для настройки", b.as_markup())
     await callback.answer()
@@ -573,7 +475,7 @@ async def cb_edit_country(callback: CallbackQuery):
 
     name, price, active = row
     b = InlineKeyboardBuilder()
-    b.row(InlineKeyboardButton(text="🔄 Включить/Выключить", callback_data=f"toggle_{cid}"))
+    b.row(InlineKeyboardButton(text="🔄 Включить / Выключить", callback_data=f"toggle_{cid}"))
     b.row(InlineKeyboardButton(text="🗑 Удалить страну", callback_data=f"delc_{cid}"))
     b.row(InlineKeyboardButton(text="◀️ Назад", callback_data="manage_countries"))
 
@@ -588,7 +490,6 @@ async def cb_toggle(callback: CallbackQuery):
         await db.execute("UPDATE countries SET is_active = 1 - is_active WHERE id=?", (cid,))
         await db.commit()
     await callback.answer("Статус изменён")
-    # Обновляем сообщение
     callback.data = f"editc_{cid}"
     await cb_edit_country(callback)
 
@@ -615,7 +516,7 @@ async def cb_add_numbers(callback: CallbackQuery):
     b = InlineKeyboardBuilder()
     for cid, name in rows:
         b.row(InlineKeyboardButton(text=name, callback_data=f"addnum_{cid}"))
-    b.row(InlineKeyboardButton(text="◀️ Назад", callback_data="admin"))
+    b.row(InlineKeyboardButton(text="◀️ Назад", callback_data="numbers_menu"))
     await safe_edit(callback, "Выберите страну для добавления номеров:", b.as_markup())
     await callback.answer()
 
@@ -645,6 +546,47 @@ async def save_numbers(message: Message, state: FSMContext):
     await message.answer(f"✅ Добавлено новых номеров: {added}")
     await state.clear()
 
+# --- Тестовый режим ---
+@router.callback_query(F.data == "test_mode")
+async def cb_test_mode(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    b = InlineKeyboardBuilder()
+    b.row(InlineKeyboardButton(text="➕ Добавить пользователя", callback_data="add_test_user"))
+    b.row(InlineKeyboardButton(text="📋 Список тестовых", callback_data="list_test_users"))
+    b.row(InlineKeyboardButton(text="◀️ Назад", callback_data="admin"))
+    await safe_edit(callback, "🧪 <b>Тестовый режим</b>\n\nПользователи из списка получают номера без оплаты.", b.as_markup())
+    await callback.answer()
+
+@router.callback_query(F.data == "add_test_user")
+async def cb_add_test_user(callback: CallbackQuery, state: FSMContext):
+    await safe_edit(callback, "Отправьте Telegram ID пользователя:")
+    await state.set_state(Form.add_test_user)
+    await callback.answer()
+
+@router.message(Form.add_test_user)
+async def process_add_test(message: Message, state: FSMContext):
+    try:
+        uid = int(message.text.strip())
+    except:
+        await message.answer("Нужен числовой ID")
+        return
+    async with aiosqlite.connect("database.db") as db:
+        await db.execute("INSERT OR IGNORE INTO test_users (user_id) VALUES (?)", (uid,))
+        await db.commit()
+    await message.answer(f"✅ Пользователь {uid} добавлен в тестовый режим")
+    await state.clear()
+
+@router.callback_query(F.data == "list_test_users")
+async def cb_list_test(callback: CallbackQuery):
+    async with aiosqlite.connect("database.db") as db:
+        cur = await db.execute("SELECT user_id FROM test_users")
+        rows = await cur.fetchall()
+    text = "<b>Тестовые пользователи:</b>\n\n" + "\n".join(str(r[0]) for r in rows) if rows else "Список пуст"
+    await safe_edit(callback, text, back_kb("test_mode"))
+    await callback.answer()
+
+# --- Заказы и статистика ---
 @router.callback_query(F.data == "all_orders")
 async def cb_all_orders(callback: CallbackQuery):
     async with aiosqlite.connect("database.db") as db:
