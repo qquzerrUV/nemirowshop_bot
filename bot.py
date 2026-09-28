@@ -1,8 +1,10 @@
 import asyncio
 import logging
 import os
+import json
 from datetime import datetime
 
+import aiohttp
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
@@ -18,6 +20,7 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID"))
+CRYPTO_BOT_TOKEN = os.getenv("CRYPTO_BOT_TOKEN")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -38,13 +41,24 @@ async def init_db():
             )
         """)
         await db.execute("""
+            CREATE TABLE IF NOT EXISTS numbers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                country_id INTEGER,
+                number TEXT NOT NULL,
+                is_sold INTEGER DEFAULT 0,
+                FOREIGN KEY (country_id) REFERENCES countries(id)
+            )
+        """)
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS orders (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
                 username TEXT,
                 country TEXT,
                 price INTEGER,
+                number TEXT,
                 status TEXT DEFAULT 'new',
+                invoice_id TEXT,
                 created_at TEXT
             )
         """)
@@ -70,12 +84,46 @@ async def set_banner(file_id: str):
         )
         await db.commit()
 
+# ====================== CRYPTOBOT ======================
+
+async def create_invoice(amount: int, description: str, order_id: int):
+    url = "https://pay.crypt.bot/api/createInvoice"
+    headers = {"Crypto-Pay-API-Token": CRYPTO_BOT_TOKEN}
+    payload = {
+        "asset": "USDT",
+        "amount": str(amount),
+        "description": description,
+        "payload": str(order_id),
+        "expires_in": 3600
+    }
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, headers=headers, json=payload) as resp:
+            data = await resp.json()
+            if data.get("ok"):
+                return data["result"]
+            else:
+                logging.error(f"CryptoBot error: {data}")
+                return None
+
+async def check_invoice(invoice_id: str):
+    url = f"https://pay.crypt.bot/api/getInvoices?invoice_ids={invoice_id}"
+    headers = {"Crypto-Pay-API-Token": CRYPTO_BOT_TOKEN}
+
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, headers=headers) as resp:
+            data = await resp.json()
+            if data.get("ok") and data["result"]["items"]:
+                return data["result"]["items"][0]
+            return None
+
 # ====================== СОСТОЯНИЯ ======================
 
 class AdminStates(StatesGroup):
     add_country_name = State()
     add_country_price = State()
     add_country_desc = State()
+    add_numbers = State()
     reply_to_user = State()
     waiting_banner = State()
 
@@ -95,6 +143,7 @@ def admin_menu_kb():
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(text="➕ Добавить страну", callback_data="add_country"))
     builder.row(InlineKeyboardButton(text="📋 Список стран", callback_data="list_countries"))
+    builder.row(InlineKeyboardButton(text="🔢 Добавить номера", callback_data="add_numbers"))
     builder.row(InlineKeyboardButton(text="📦 Все заказы", callback_data="all_orders"))
     builder.row(InlineKeyboardButton(text="🖼️ Загрузить баннер", callback_data="upload_banner"))
     builder.row(InlineKeyboardButton(text="📊 Статистика", callback_data="stats"))
@@ -117,7 +166,7 @@ async def cmd_start(message: Message):
         f"👋 <b>Добро пожаловать!</b>\n\n"
         f"Привет, <b>{message.from_user.first_name}</b>!\n\n"
         "Я бот по продаже физических SIM-карт и номеров.\n"
-        "Выбирай страну → оформляй заказ → получай номер."
+        "Выбирай страну → оплачивай → получай номер."
     )
 
     if banner:
@@ -138,7 +187,10 @@ async def main_menu(callback: CallbackQuery):
         f"Привет, <b>{callback.from_user.first_name}</b>!\n"
         "Выбери нужный раздел:"
     )
-    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=main_menu_kb(is_admin))
+    try:
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=main_menu_kb(is_admin))
+    except:
+        await callback.message.answer(text, parse_mode="HTML", reply_markup=main_menu_kb(is_admin))
     await callback.answer()
 
 # ====================== ИНФОРМАЦИЯ ======================
@@ -146,11 +198,11 @@ async def main_menu(callback: CallbackQuery):
 @router.callback_query(F.data == "info")
 async def info(callback: CallbackQuery):
     text = (
-        "<b>ℹ️ Информация о магазине</b>\n\n"
-        "• Продаём физические SIM-карты\n"
-        "• Работаем по предоплате\n"
-        "• Доставка / встреча — по договорённости\n\n"
-        "По всем вопросам пишите через кнопку «Написать продавцу»"
+        "<b>ℹ️ Информация</b>\n\n"
+        "• Физические SIM-карты\n"
+        "• Оплата через CryptoBot (USDT)\n"
+        "• Автоматическая выдача номера после оплаты\n"
+        "• Поддержка 24/7"
     )
     await callback.message.edit_text(text, parse_mode="HTML", reply_markup=back_to_main_kb())
     await callback.answer()
@@ -160,29 +212,34 @@ async def info(callback: CallbackQuery):
 @router.callback_query(F.data == "buy")
 async def show_catalog(callback: CallbackQuery):
     async with aiosqlite.connect("database.db") as db:
-        cursor = await db.execute(
-            "SELECT id, name, price FROM countries WHERE is_active = 1 ORDER BY name"
-        )
+        cursor = await db.execute("""
+            SELECT c.id, c.name, c.price, 
+                   (SELECT COUNT(*) FROM numbers n WHERE n.country_id = c.id AND n.is_sold = 0) as stock
+            FROM countries c
+            WHERE c.is_active = 1
+            ORDER BY c.name
+        """)
         countries = await cursor.fetchall()
 
     if not countries:
         await callback.message.edit_text(
-            "Сейчас нет доступных номеров.\nЗагляни позже.",
+            "Сейчас нет доступных номеров.",
             reply_markup=back_to_main_kb()
         )
         await callback.answer()
         return
 
     builder = InlineKeyboardBuilder()
-    for c_id, name, price in countries:
+    for c_id, name, price, stock in countries:
+        stock_text = f"({stock} шт)" if stock > 0 else "(нет в наличии)"
         builder.row(InlineKeyboardButton(
-            text=f"{name} — {price} ₽",
+            text=f"{name} — {price} ₽ {stock_text}",
             callback_data=f"country_{c_id}"
         ))
     builder.row(InlineKeyboardButton(text="◀️ Назад в меню", callback_data="main_menu"))
 
     await callback.message.edit_text(
-        "<b>📱 Выбери страну / оператора:</b>",
+        "<b>📱 Выбери страну:</b>",
         parse_mode="HTML",
         reply_markup=builder.as_markup()
     )
@@ -197,25 +254,35 @@ async def select_country(callback: CallbackQuery):
             "SELECT name, price, description FROM countries WHERE id = ?", (country_id,)
         )
         row = await cursor.fetchone()
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM numbers WHERE country_id = ? AND is_sold = 0", (country_id,)
+        )
+        stock = (await cursor.fetchone())[0]
 
     if not row:
         await callback.answer("Страна больше не доступна", show_alert=True)
         return
 
     name, price, desc = row
-    text = f"<b>{name}</b>\n\nЦена: <b>{price} ₽</b>\n\n{desc or 'Описание отсутствует'}"
+    text = (
+        f"<b>{name}</b>\n\n"
+        f"Цена: <b>{price} ₽</b>\n"
+        f"В наличии: <b>{stock} шт</b>\n\n"
+        f"{desc or ''}"
+    )
 
     builder = InlineKeyboardBuilder()
-    builder.row(InlineKeyboardButton(text="✅ Оформить заказ", callback_data=f"order_{country_id}"))
+    if stock > 0:
+        builder.row(InlineKeyboardButton(text="💳 Оплатить", callback_data=f"pay_{country_id}"))
     builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data="buy"))
 
     await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="HTML")
     await callback.answer()
 
-# ====================== ОФОРМЛЕНИЕ ЗАКАЗА ======================
+# ====================== ОПЛАТА ======================
 
-@router.callback_query(F.data.startswith("order_"))
-async def make_order(callback: CallbackQuery):
+@router.callback_query(F.data.startswith("pay_"))
+async def create_payment(callback: CallbackQuery):
     country_id = int(callback.data.split("_")[1])
 
     async with aiosqlite.connect("database.db") as db:
@@ -223,49 +290,141 @@ async def make_order(callback: CallbackQuery):
             "SELECT name, price FROM countries WHERE id = ?", (country_id,)
         )
         row = await cursor.fetchone()
+        cursor = await db.execute(
+            "SELECT id, number FROM numbers WHERE country_id = ? AND is_sold = 0 LIMIT 1",
+            (country_id,)
+        )
+        number_row = await cursor.fetchone()
 
-    if not row:
-        await callback.answer("Ошибка", show_alert=True)
+    if not row or not number_row:
+        await callback.answer("Номера закончились", show_alert=True)
         return
 
     name, price = row
+    number_id, number = number_row
 
+    # Создаём заказ
     async with aiosqlite.connect("database.db") as db:
         cursor = await db.execute(
-            """INSERT INTO orders (user_id, username, country, price, created_at)
-               VALUES (?, ?, ?, ?, ?)""",
+            """INSERT INTO orders (user_id, username, country, price, number, status, created_at)
+               VALUES (?, ?, ?, ?, ?, 'pending', ?)""",
             (
                 callback.from_user.id,
                 callback.from_user.username,
                 name,
                 price,
+                number,
                 datetime.now().strftime("%Y-%m-%d %H:%M")
             )
         )
         order_id = cursor.lastrowid
         await db.commit()
 
-    text = (
-        f"✅ <b>Заказ #{order_id} принят!</b>\n\n"
-        f"Страна: {name}\n"
-        f"Цена: {price} ₽\n\n"
-        "Скоро с тобой свяжется администратор."
+    # Создаём счёт в CryptoBot
+    invoice = await create_invoice(
+        amount=price,
+        description=f"Номер {name} | Заказ #{order_id}",
+        order_id=order_id
     )
 
-    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=back_to_main_kb())
+    if not invoice:
+        await callback.message.edit_text(
+            "Ошибка создания счёта. Попробуйте позже.",
+            reply_markup=back_to_main_kb()
+        )
+        return
 
-    # Уведомление админу
-    text_admin = (
-        f"🆕 <b>Новый заказ #{order_id}</b>\n\n"
-        f"От: @{callback.from_user.username or 'нет'} (ID: {callback.from_user.id})\n"
-        f"Страна: {name}\n"
-        f"Цена: {price} ₽"
-    )
+    invoice_id = invoice["invoice_id"]
+    pay_url = invoice["pay_url"]
+
+    # Сохраняем invoice_id
+    async with aiosqlite.connect("database.db") as db:
+        await db.execute(
+            "UPDATE orders SET invoice_id = ? WHERE id = ?",
+            (str(invoice_id), order_id)
+        )
+        await db.commit()
+
     builder = InlineKeyboardBuilder()
-    builder.row(InlineKeyboardButton(text="💬 Ответить", callback_data=f"reply_{callback.from_user.id}"))
-    builder.row(InlineKeyboardButton(text="📦 Статус", callback_data=f"status_{order_id}"))
+    builder.row(InlineKeyboardButton(text="💳 Оплатить", url=pay_url))
+    builder.row(InlineKeyboardButton(text="🔄 Проверить оплату", callback_data=f"check_{order_id}"))
+    builder.row(InlineKeyboardButton(text="◀️ В меню", callback_data="main_menu"))
 
-    await bot.send_message(ADMIN_ID, text_admin, parse_mode="HTML", reply_markup=builder.as_markup())
+    await callback.message.edit_text(
+        f"<b>Заказ #{order_id}</b>\n\n"
+        f"Страна: {name}\n"
+        f"Сумма: <b>{price} ₽</b> (в USDT)\n\n"
+        f"Нажми «Оплатить» и после оплаты нажми «Проверить оплату».",
+        parse_mode="HTML",
+        reply_markup=builder.as_markup()
+    )
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("check_"))
+async def check_payment(callback: CallbackQuery):
+    order_id = int(callback.data.split("_")[1])
+
+    async with aiosqlite.connect("database.db") as db:
+        cursor = await db.execute(
+            "SELECT invoice_id, status, number, country, user_id FROM orders WHERE id = ?",
+            (order_id,)
+        )
+        row = await cursor.fetchone()
+
+    if not row:
+        await callback.answer("Заказ не найден", show_alert=True)
+        return
+
+    invoice_id, status, number, country, user_id = row
+
+    if status == "paid":
+        await callback.message.edit_text(
+            f"✅ <b>Заказ уже оплачен!</b>\n\n"
+            f"Ваш номер: <code>{number}</code>\n"
+            f"Страна: {country}",
+            parse_mode="HTML",
+            reply_markup=back_to_main_kb()
+        )
+        await callback.answer()
+        return
+
+    # Проверяем статус в CryptoBot
+    invoice = await check_invoice(invoice_id)
+
+    if not invoice:
+        await callback.answer("Не удалось проверить оплату", show_alert=True)
+        return
+
+    if invoice["status"] == "paid":
+        # Выдаём номер
+        async with aiosqlite.connect("database.db") as db:
+            await db.execute("UPDATE orders SET status = 'paid' WHERE id = ?", (order_id,))
+            await db.execute(
+                "UPDATE numbers SET is_sold = 1 WHERE number = ?", (number,)
+            )
+            await db.commit()
+
+        await callback.message.edit_text(
+            f"✅ <b>Оплата прошла успешно!</b>\n\n"
+            f"Ваш номер: <code>{number}</code>\n"
+            f"Страна: {country}\n\n"
+            f"Спасибо за покупку!",
+            parse_mode="HTML",
+            reply_markup=back_to_main_kb()
+        )
+
+        # Уведомление админу
+        await bot.send_message(
+            ADMIN_ID,
+            f"✅ <b>Оплачен заказ #{order_id}</b>\n\n"
+            f"Пользователь: @{callback.from_user.username or callback.from_user.id}\n"
+            f"Страна: {country}\n"
+            f"Номер: <code>{number}</code>",
+            parse_mode="HTML"
+        )
+    else:
+        await callback.answer("Оплата ещё не поступила", show_alert=True)
+
     await callback.answer()
 
 # ====================== МОИ ЗАКАЗЫ ======================
@@ -274,22 +433,20 @@ async def make_order(callback: CallbackQuery):
 async def my_orders(callback: CallbackQuery):
     async with aiosqlite.connect("database.db") as db:
         cursor = await db.execute(
-            "SELECT id, country, price, status, created_at FROM orders WHERE user_id = ? ORDER BY id DESC",
+            "SELECT id, country, price, number, status, created_at FROM orders WHERE user_id = ? ORDER BY id DESC",
             (callback.from_user.id,)
         )
         orders = await cursor.fetchall()
 
     if not orders:
-        await callback.message.edit_text(
-            "У тебя пока нет заказов.",
-            reply_markup=back_to_main_kb()
-        )
+        await callback.message.edit_text("У тебя пока нет заказов.", reply_markup=back_to_main_kb())
         await callback.answer()
         return
 
     text = "<b>📦 Твои заказы:</b>\n\n"
-    for o_id, country, price, status, created in orders:
-        text += f"#{o_id} | {country} | {price} ₽ | <b>{status}</b> | {created}\n"
+    for o_id, country, price, number, status, created in orders:
+        num_text = f" | <code>{number}</code>" if number and status == "paid" else ""
+        text += f"#{o_id} | {country} | {price} ₽ | <b>{status}</b>{num_text}\n"
 
     await callback.message.edit_text(text, parse_mode="HTML", reply_markup=back_to_main_kb())
     await callback.answer()
@@ -299,8 +456,7 @@ async def my_orders(callback: CallbackQuery):
 @router.callback_query(F.data == "support")
 async def support(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text(
-        "💬 <b>Написать продавцу</b>\n\n"
-        "Просто напиши сообщение в чат — я передам его администратору.",
+        "💬 <b>Написать продавцу</b>\n\nПросто напиши сообщение в чат.",
         parse_mode="HTML",
         reply_markup=back_to_main_kb()
     )
@@ -313,10 +469,10 @@ async def process_message(message: Message, state: FSMContext):
     data = await state.get_data()
     target = data.get("target_user")
 
-    if target:  # админ отвечает клиенту
+    if target:
         await bot.send_message(target, f"💬 <b>Ответ продавца:</b>\n\n{message.text}", parse_mode="HTML")
-        await message.answer("Сообщение отправлено клиенту.")
-    else:  # клиент пишет админу
+        await message.answer("Сообщение отправлено.")
+    else:
         await bot.send_message(
             ADMIN_ID,
             f"💬 Сообщение от @{message.from_user.username or 'нет'} (ID: {message.from_user.id}):\n\n{message.text}",
@@ -324,8 +480,7 @@ async def process_message(message: Message, state: FSMContext):
                 [InlineKeyboardButton(text="Ответить", callback_data=f"reply_{message.from_user.id}")]
             ])
         )
-        await message.answer("Сообщение отправлено продавцу.", reply_markup=back_to_main_kb())
-
+        await message.answer("Сообщение отправлено продавцу.")
     await state.clear()
 
 @router.callback_query(F.data.startswith("reply_"))
@@ -336,36 +491,28 @@ async def admin_reply_start(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AdminStates.reply_to_user)
     await callback.answer()
 
-# ====================== АДМИН-ПАНЕЛЬ ======================
+# ====================== АДМИНКА ======================
 
 @router.callback_query(F.data == "admin")
 async def admin_panel(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         await callback.answer("Нет доступа", show_alert=True)
         return
-    await callback.message.edit_text(
-        "⚙️ <b>Админ-панель</b>",
-        parse_mode="HTML",
-        reply_markup=admin_menu_kb()
-    )
+    await callback.message.edit_text("⚙️ <b>Админ-панель</b>", parse_mode="HTML", reply_markup=admin_menu_kb())
     await callback.answer()
 
 @router.callback_query(F.data == "upload_banner")
 async def upload_banner_start(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id != ADMIN_ID:
         return
-    await callback.message.edit_text(
-        "🖼️ Отправь фото, которое будет показываться при /start",
-        reply_markup=back_to_main_kb()
-    )
+    await callback.message.edit_text("🖼️ Отправь фото-баннер:")
     await state.set_state(AdminStates.waiting_banner)
     await callback.answer()
 
 @router.message(AdminStates.waiting_banner, F.photo)
 async def save_banner(message: Message, state: FSMContext):
-    file_id = message.photo[-1].file_id
-    await set_banner(file_id)
-    await message.answer("✅ Баннер успешно установлен!", reply_markup=main_menu_kb(True))
+    await set_banner(message.photo[-1].file_id)
+    await message.answer("✅ Баннер установлен!", reply_markup=main_menu_kb(True))
     await state.clear()
 
 @router.callback_query(F.data == "add_country")
@@ -379,18 +526,18 @@ async def add_country_start(callback: CallbackQuery, state: FSMContext):
 @router.message(AdminStates.add_country_name)
 async def add_country_name(message: Message, state: FSMContext):
     await state.update_data(name=message.text)
-    await message.answer("Цена в рублях (только число):")
+    await message.answer("Цена в рублях (число):")
     await state.set_state(AdminStates.add_country_price)
 
 @router.message(AdminStates.add_country_price)
 async def add_country_price(message: Message, state: FSMContext):
     try:
         price = int(message.text)
-    except ValueError:
-        await message.answer("Нужно число. Попробуй ещё раз:")
+    except:
+        await message.answer("Нужно число:")
         return
     await state.update_data(price=price)
-    await message.answer("Описание (можно «-»):")
+    await message.answer("Описание (или «-»):")
     await state.set_state(AdminStates.add_country_desc)
 
 @router.message(AdminStates.add_country_desc)
@@ -405,10 +552,56 @@ async def add_country_desc(message: Message, state: FSMContext):
         )
         await db.commit()
 
-    await message.answer(
-        f"✅ Страна «{data['name']}» добавлена за {data['price']} ₽",
-        reply_markup=admin_menu_kb()
+    await message.answer(f"✅ Страна «{data['name']}» добавлена.", reply_markup=admin_menu_kb())
+    await state.clear()
+
+@router.callback_query(F.data == "add_numbers")
+async def add_numbers_start(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        return
+
+    async with aiosqlite.connect("database.db") as db:
+        cursor = await db.execute("SELECT id, name FROM countries ORDER BY name")
+        countries = await cursor.fetchall()
+
+    if not countries:
+        await callback.answer("Сначала добавьте страны", show_alert=True)
+        return
+
+    builder = InlineKeyboardBuilder()
+    for c_id, name in countries:
+        builder.row(InlineKeyboardButton(text=name, callback_data=f"addnum_{c_id}"))
+    builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data="admin"))
+
+    await callback.message.edit_text("Выбери страну для добавления номеров:", reply_markup=builder.as_markup())
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("addnum_"))
+async def add_numbers_country(callback: CallbackQuery, state: FSMContext):
+    country_id = int(callback.data.split("_")[1])
+    await state.update_data(country_id=country_id)
+    await callback.message.edit_text(
+        "Отправь номера (каждый с новой строки):\n\n"
+        "Пример:\n+79001234567\n+79007654321"
     )
+    await state.set_state(AdminStates.add_numbers)
+    await callback.answer()
+
+@router.message(AdminStates.add_numbers)
+async def save_numbers(message: Message, state: FSMContext):
+    data = await state.get_data()
+    country_id = data["country_id"]
+    numbers = [n.strip() for n in message.text.split("\n") if n.strip()]
+
+    async with aiosqlite.connect("database.db") as db:
+        for num in numbers:
+            await db.execute(
+                "INSERT INTO numbers (country_id, number) VALUES (?, ?)",
+                (country_id, num)
+            )
+        await db.commit()
+
+    await message.answer(f"✅ Добавлено номеров: {len(numbers)}", reply_markup=admin_menu_kb())
     await state.clear()
 
 @router.callback_query(F.data == "list_countries")
@@ -417,20 +610,18 @@ async def list_countries(callback: CallbackQuery):
         return
 
     async with aiosqlite.connect("database.db") as db:
-        cursor = await db.execute("SELECT id, name, price, is_active FROM countries ORDER BY name")
+        cursor = await db.execute("""
+            SELECT c.id, c.name, c.price,
+                   (SELECT COUNT(*) FROM numbers n WHERE n.country_id = c.id AND n.is_sold = 0) as stock
+            FROM countries c ORDER BY c.name
+        """)
         countries = await cursor.fetchall()
 
-    if not countries:
-        await callback.message.edit_text("Список пуст.", reply_markup=admin_menu_kb())
-        await callback.answer()
-        return
-
     text = "<b>📋 Список стран:</b>\n\n"
-    for c_id, name, price, active in countries:
-        status = "✅" if active else "❌"
-        text += f"{status} #{c_id} {name} — {price} ₽\n"
+    for c_id, name, price, stock in countries:
+        text += f"#{c_id} {name} — {price} ₽ | Остаток: {stock}\n"
 
-    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=admin_menu_kb())
+    await callback.message.edit_text(text or "Пусто", parse_mode="HTML", reply_markup=admin_menu_kb())
     await callback.answer()
 
 @router.callback_query(F.data == "all_orders")
@@ -440,22 +631,15 @@ async def all_orders(callback: CallbackQuery):
 
     async with aiosqlite.connect("database.db") as db:
         cursor = await db.execute(
-            "SELECT id, user_id, username, country, price, status, created_at FROM orders ORDER BY id DESC LIMIT 15"
+            "SELECT id, username, country, price, number, status, created_at FROM orders ORDER BY id DESC LIMIT 15"
         )
         orders = await cursor.fetchall()
 
-    if not orders:
-        await callback.message.edit_text("Заказов пока нет.", reply_markup=admin_menu_kb())
-        await callback.answer()
-        return
-
     text = "<b>📦 Последние заказы:</b>\n\n"
-    for o_id, user_id, username, country, price, status, created in orders:
-        text += (
-            f"#{o_id} | @{username or user_id} | {country} | {price} ₽\n"
-            f"Статус: <b>{status}</b> | {created}\n\n"
-        )
-    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=admin_menu_kb())
+    for o_id, username, country, price, number, status, created in orders:
+        text += f"#{o_id} | @{username or '—'} | {country} | {price}₽ | {status}\n"
+
+    await callback.message.edit_text(text or "Пусто", parse_mode="HTML", reply_markup=admin_menu_kb())
     await callback.answer()
 
 @router.callback_query(F.data == "stats")
@@ -464,60 +648,12 @@ async def stats(callback: CallbackQuery):
         return
 
     async with aiosqlite.connect("database.db") as db:
-        cursor = await db.execute("SELECT COUNT(*) FROM orders")
-        total = (await cursor.fetchone())[0]
-        cursor = await db.execute("SELECT COUNT(*) FROM orders WHERE status = 'new'")
-        new = (await cursor.fetchone())[0]
-        cursor = await db.execute("SELECT SUM(price) FROM orders WHERE status IN ('paid', 'done')")
-        money = (await cursor.fetchone())[0] or 0
+        total = (await (await db.execute("SELECT COUNT(*) FROM orders")).fetchone())[0]
+        paid = (await (await db.execute("SELECT COUNT(*) FROM orders WHERE status = 'paid'")).fetchone())[0]
+        money = (await (await db.execute("SELECT SUM(price) FROM orders WHERE status = 'paid'")).fetchone())[0] or 0
 
-    text = (
-        f"📊 <b>Статистика</b>\n\n"
-        f"Всего заказов: {total}\n"
-        f"Новых: {new}\n"
-        f"Заработано: {money} ₽"
-    )
+    text = f"📊 <b>Статистика</b>\n\nВсего заказов: {total}\nОплачено: {paid}\nСумма: {money} ₽"
     await callback.message.edit_text(text, parse_mode="HTML", reply_markup=admin_menu_kb())
-    await callback.answer()
-
-# Статусы заказа
-@router.callback_query(F.data.startswith("status_"))
-async def change_status_start(callback: CallbackQuery):
-    order_id = int(callback.data.split("_")[1])
-
-    builder = InlineKeyboardBuilder()
-    for st in ["new", "paid", "shipped", "done", "cancelled"]:
-        builder.row(InlineKeyboardButton(text=st, callback_data=f"setstatus_{order_id}_{st}"))
-    builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data="all_orders"))
-
-    await callback.message.edit_text(
-        f"Выбери новый статус для заказа #{order_id}:",
-        reply_markup=builder.as_markup()
-    )
-    await callback.answer()
-
-@router.callback_query(F.data.startswith("setstatus_"))
-async def set_status(callback: CallbackQuery):
-    parts = callback.data.split("_")
-    order_id = int(parts[1])
-    new_status = parts[2]
-
-    async with aiosqlite.connect("database.db") as db:
-        await db.execute("UPDATE orders SET status = ? WHERE id = ?", (new_status, order_id))
-        cursor = await db.execute("SELECT user_id FROM orders WHERE id = ?", (order_id,))
-        user_id = (await cursor.fetchone())[0]
-        await db.commit()
-
-    await bot.send_message(
-        user_id,
-        f"📦 Статус твоего заказа #{order_id} изменён на: <b>{new_status}</b>",
-        parse_mode="HTML"
-    )
-    await callback.message.edit_text(
-        f"✅ Статус заказа #{order_id} → <b>{new_status}</b>",
-        parse_mode="HTML",
-        reply_markup=admin_menu_kb()
-    )
     await callback.answer()
 
 # ====================== ЗАПУСК ======================
